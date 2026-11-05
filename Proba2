@@ -1,0 +1,328 @@
+# bot_txt2dxf.py  —  TXT-координаты -> DXF через Telegram
+import logging
+import os
+import re
+import tempfile
+from pathlib import Path
+
+import ezdxf
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("txt2dxf")
+
+# ---------- настройки по умолчанию (на каждого пользователя свои) ----------
+DEFAULTS = {
+    "mode": "auto",           # auto | xy | xyz | nxy | nxyz
+    "decimal_comma": False,   # 100,5 вместо 100.5
+    "swap": False,            # поменять X <-> Y (геодезия N/E)
+    "polyline": True,         # соединять точки по порядку
+    "labels": True,           # подписи 1, 2, 3...
+    "units": "m",             # единицы в $INSUNITS
+}
+
+# коды AutoCAD $INSUNITS
+UNITS = {"in": 1, "ft": 2, "mm": 4, "cm": 5, "m": 6, "km": 7}
+METRIC = {"mm", "cm", "m", "km"}
+
+NUM = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
+NUM_FULL = re.compile(rf"^{NUM}$")
+PREFIX_NUM = re.compile(rf"^[A-Za-zА-Яа-я_]+[=:]\s*({NUM})$")  # X=100.5, Y:200
+
+
+def cfg(context) -> dict:
+    d = context.user_data
+    for k, v in DEFAULTS.items():
+        d.setdefault(k, v)
+    return d
+
+
+# ---------- парсер ----------
+def parse_points(text: str, c: dict):
+    """Возвращает ([(x, y, z), ...], сколько строк пропущено)."""
+    points, skipped = [], 0
+
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].split("//", 1)[0].strip()
+        if not line:
+            continue
+        if not re.search(r"\d", line):        # шапка вида "№ X Y Z"
+            skipped += 1
+            continue
+
+        if c["decimal_comma"]:
+            # при десятичной запятой разделители ТОЛЬКО пробел / ; / таб
+            tokens = re.split(r"[\s;]+", line.replace("\t", " "))
+        else:
+            tokens = re.split(r"[\s,;]+", line.replace("\t", " "))
+
+        pairs = []  # (сырой токен, число)
+        for tok in filter(None, tokens):
+            t = tok
+            if c["decimal_comma"]:
+                t = re.sub(r"(?<=\d),(?=\d)", ".", t)   # 100,5 -> 100.5
+
+            if NUM_FULL.match(t):
+                pairs.append((t, float(t)))
+                continue
+            m = PREFIX_NUM.match(t)
+            if m:
+                pairs.append((m.group(1), float(m.group(1))))
+                continue
+            # P1, т.1, "X", "=", мусорные подписи — игнорируем
+
+        if not pairs:
+            skipped += 1
+            continue
+
+        mode = c["mode"]
+        v = [val for _, val in pairs]
+
+        if mode == "xy":
+            v = v[:2]
+        elif mode == "xyz":
+            v = v[:3]
+        elif mode == "nxy":
+            v = v[1:3]
+        elif mode == "nxyz":
+            v = v[1:4]
+        else:  # auto
+            if len(v) >= 4:
+                v = v[1:]                                   # N X Y Z
+            elif (len(v) == 3 and NUM_FULL.match(pairs[0][0])
+                  and "." not in pairs[0][0]
+                  and ("." in pairs[1][0] or "." in pairs[2][0])):
+                v = v[1:]                                   # N X Y
+            v = v[:3]
+
+        if len(v) < 2:
+            skipped += 1
+            continue
+
+        x, y = v[0], v[1]
+        z = v[2] if len(v) > 2 else 0.0
+        if c["swap"]:
+            x, y = y, x
+        points.append((x, y, z))
+
+    return points, skipped
+
+
+def read_text(path: Path) -> str:
+    """utf-8 с BOM -> cp1251 -> latin-1 (чтобы не было кракозябр)."""
+    data = path.read_bytes()
+    for enc in ("utf-8-sig", "cp1251", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+# ---------- DXF ----------
+def build_dxf(points, c: dict, out: Path):
+    doc = ezdxf.new("R2010", setup=True)
+    doc.header["$INSUNITS"] = UNITS.get(c["units"], 6)
+    doc.header["$MEASUREMENT"] = 1 if c["units"] in METRIC else 0
+    msp = doc.modelspace()
+
+    for name, color in (("POINTS", 1), ("NUMBERS", 7), ("POLYLINE", 5)):
+        if name not in doc.layers:
+            doc.layers.new(name, dxfattribs={"color": color})
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    h = max(span / 200.0, 1e-6)   # высота подписей относительно размаха
+
+    for i, (x, y, z) in enumerate(points, 1):
+        msp.add_point((x, y, z), dxfattribs={"layer": "POINTS"})
+        if c["labels"]:
+            msp.add_text(
+                str(i),
+                dxfattribs={
+                    "layer": "NUMBERS",
+                    "height": h,
+                    "insert": (x + h * 0.6, y + h * 0.6, z),
+                },
+            )
+
+    if c["polyline"] and len(points) >= 2:
+        # LWPOLYLINE плоская: Z остаётся в точках на слое POINTS
+        msp.add_lwpolyline(
+            [(x, y) for x, y, _ in points],
+            dxfattribs={"layer": "POLYLINE"},
+        )
+
+    doc.saveas(out)
+
+
+# ---------- справка ----------
+HELP = """<b>TXT → DXF</b>
+
+Пришлите файл <code>.txt</code> или просто вставьте координаты сообщением.
+Одна строка = одна точка. Разделители: пробел, таб, запятая, <code>;</code>.
+
+<code>100.50 200.30</code>            → X Y
+<code>100.50 200.30 15.2</code>       → X Y Z
+<code>1, 100.50, 200.30</code>        → № X Y (авто)
+<code>1; 100.50; 200.30; 15.2</code>  → № X Y Z
+<code>X=100.50 Y=200.30</code>        → тоже ок
+
+Комментарии <code>#</code> и <code>//</code>, а также шапки без цифр пропускаются.
+
+<b>На выходе:</b> слои POINTS (точки с Z), NUMBERS (номера), POLYLINE (линия по порядку).
+
+<b>Настройки:</b>
+/mode auto|xy|xyz|nxy|nxyz — как читать колонки (сейчас auto)
+/comma — десятичная запятая <code>100,5;200,3</code> (вкл/выкл)
+/swap — поменять X и Y местами
+/line — полилиния (вкл/выкл)
+/labels — подписи номеров (вкл/выкл)
+/units in|ft|mm|cm|m|km — единицы (сейчас m)
+/status — текущие настройки
+/help — эта справка"""
+
+
+# ---------- команды ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg(context)
+    await update.message.reply_text(HELP, parse_mode="HTML")
+
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = cfg(context)
+    val = (context.args or [""])[0].lower()
+    if val not in {"auto", "xy", "xyz", "nxy", "nxyz"}:
+        await update.message.reply_text("Режимы: auto, xy, xyz, nxy, nxyz")
+        return
+    c["mode"] = val
+    await update.message.reply_text(f"Режим: <b>{val}</b>", parse_mode="HTML")
+
+
+async def _toggle(update, context, key, title):
+    c = cfg(context)
+    c[key] = not c[key]
+    state = "вкл" if c[key] else "выкл"
+    await update.message.reply_text(f"{title}: <b>{state}</b>", parse_mode="HTML")
+
+
+async def cmd_comma(update, context):  await _toggle(update, context, "decimal_comma", "Десятичная запятая")
+async def cmd_swap(update, context):   await _toggle(update, context, "swap", "Обмен X↔Y")
+async def cmd_line(update, context):   await _toggle(update, context, "polyline", "Полилиния")
+async def cmd_labels(update, context): await _toggle(update, context, "labels", "Подписи")
+
+
+async def cmd_units(update, context):
+    c = cfg(context)
+    val = (context.args or [""])[0].lower()
+    if val not in UNITS:
+        await update.message.reply_text("Единицы: in, ft, mm, cm, m, km")
+        return
+    c["units"] = val
+    await update.message.reply_text(f"Единицы: {val} ($INSUNITS={UNITS[val]})")
+
+
+async def cmd_status(update, context):
+    c = cfg(context)
+    await update.message.reply_text(
+        f"mode={c['mode']} | comma={c['decimal_comma']} | swap={c['swap']} | "
+        f"line={c['polyline']} | labels={c['labels']} | units={c['units']}"
+    )
+
+
+# ---------- конвертация ----------
+async def convert_and_send(update, context, text: str, source_name: str):
+    c = cfg(context)
+    points, skipped = parse_points(text, c)
+
+    if not points:
+        await update.message.reply_text(
+            "Не нашёл ни одной координаты 🤔\n"
+            "Проверьте /start. Если числа вида 100,5 — включите /comma. "
+            "Если первая колонка — номер, попробуйте /mode nxy."
+        )
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / (Path(source_name).stem + ".dxf")
+            build_dxf(points, c, out)
+
+            caption = (
+                f"Готово: {len(points)} точек → DXF\n"
+                f"mode={c['mode']} | units={c['units']} | "
+                f"линия={'да' if c['polyline'] else 'нет'} | "
+                f"подписи={'да' if c['labels'] else 'нет'}"
+                + (f" | пропущено строк: {skipped}" if skipped else "")
+            )
+            with out.open("rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=out.name, caption=caption
+                )
+    except Exception as e:
+        log.exception("Ошибка при генерации DXF")
+        await update.message.reply_text(f"Не смог собрать DXF: {e}")
+
+
+async def handle_doc(update, context):
+    doc = update.message.document
+    name = Path(doc.file_name or "coords.txt").name
+    if not name.lower().endswith((".txt", ".csv", ".dat", ".xy")):
+        await update.message.reply_text("Жду .txt / .csv / .dat с координатами 🙂")
+        return
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("Файл больше 5 МБ — пришлите поменьше.")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / name
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(inp)
+        text = read_text(inp)
+
+    await convert_and_send(update, context, text, name)
+
+
+async def handle_text(update, context):
+    text = update.message.text or ""
+    if not re.search(r"\d", text):
+        await update.message.reply_text("Пришлите .txt или вставьте координаты. /start — справка.")
+        return
+    await convert_and_send(update, context, text, "coords.txt")
+
+
+def main():
+    if not TOKEN:
+        raise SystemExit("Задайте токен: export BOT_TOKEN='123:ABC...'")
+
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("comma", cmd_comma))
+    app.add_handler(CommandHandler("swap", cmd_swap))
+    app.add_handler(CommandHandler("line", cmd_line))
+    app.add_handler(CommandHandler("labels", cmd_labels))
+    app.add_handler(CommandHandler("units", cmd_units))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    log.info("Бот запущен, жду файлы…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
