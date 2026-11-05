@@ -20,7 +20,7 @@ from ezdxf.math import Vec3
 from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"          # ← вставьте свой токен
+BOT_TOKEN = "8834978930:AAEsvxPjsUhgJKZ3cy9r0KsSWUS8X9YgTD0"          # ← вставьте свой токен
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
 
