@@ -1,26 +1,416 @@
-def build_pdf(points, c: dict, out: Path):
+import os
+import re
+import math
+import logging
+import traceback
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+import ezdxf
+from ezdxf.math import Vec3
+from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
+
+# ================== НАСТРОЙКИ ==================
+BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"          # ← вставьте свой токен
+WORK_DIR = Path("bot_work")
+WORK_DIR.mkdir(exist_ok=True)
+
+HEIGHT_THRESHOLD = 18.0          # порог для красного цвета
+# ==============================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+WAITING_DXF_BASE = 1
+WAITING_POINTS = 2
+
+
+# ------------------------------------------------------------------
+# Парсинг точек
+# ------------------------------------------------------------------
+
+def parse_points_from_txt(text: str) -> list[tuple[str, Vec3]]:
+    """
+    Поддерживает форматы:
+        1 100.5 200.3 15.0
+        1,100.5,200.3,15.0
+        1 100,5 200,3 15,0
+        1;100,5;200,3;15,0
+        100,5 200,3 15,0          ← без номера
+    """
+    points = []
+    auto_num = 1
+
+    def normalize_number(s: str) -> str:
+        """Заменяет запятую на точку, если это десятичный разделитель."""
+        s = s.strip()
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        return s
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = re.split(r"[,;\s]+", line)
+        parts = [p for p in parts if p]
+
+        if len(parts) < 2:
+            continue
+
+        try:
+            parts = [normalize_number(p) for p in parts]
+
+            point_id = str(auto_num)
+            coords = parts
+
+            # Пробуем определить номер точки в начале строки
+            if len(parts) >= 3:
+                try:
+                    first_val = float(parts[0])
+                    if abs(first_val - round(first_val)) < 1e-9:
+                        point_id = str(int(round(first_val)))
+                        coords = parts[1:]
+                except ValueError:
+                    pass
+
+            if len(coords) < 2:
+                continue
+
+            x = float(coords[0])
+            y = float(coords[1])
+            z = float(coords[2]) if len(coords) >= 3 else 0.0
+
+            points.append((point_id, Vec3(x, y, z)))
+            auto_num += 1
+
+        except ValueError:
+            continue
+
+    return points
+
+
+# ------------------------------------------------------------------
+# Геометрия
+# ------------------------------------------------------------------
+
+def closest_point_on_segment(point: Vec3, start: Vec3, end: Vec3) -> Vec3:
+    seg = end - start
+    length2 = seg.magnitude_square
+    if length2 < 1e-12:
+        return start
+    t = max(0.0, min(1.0, (point - start).dot(seg) / length2))
+    return start + seg * t
+
+
+def find_closest_on_polyline(point: Vec3, vertices: list[Vec3]):
+    min_dist = float("inf")
+    closest = None
+    seg_idx = 0
+
+    for i in range(len(vertices) - 1):
+        start = vertices[i]
+        end = vertices[i + 1]
+        proj = closest_point_on_segment(point, start, end)
+        dist = point.distance(proj)
+        if dist < min_dist:
+            min_dist = dist
+            closest = proj
+            seg_idx = i
+
+    return closest, seg_idx, min_dist
+
+
+def create_arrow_block(doc, block_name: str = "DIM_ARROW"):
+    if block_name in doc.blocks:
+        return
+    blk = doc.blocks.new(name=block_name)
+    blk.add_lwpolyline(
+        [(0, 0), (-0.6, 1.4), (0.6, 1.4)],
+        close=True,
+        dxfattribs={"layer": "0"},
+    )
+
+
+def add_annotation(doc, point_id: str, pline_pt: Vec3, angle: float, dist: float, litera: str):
+    """Рисует стрелку + текст: номер точки, литера, отклонение."""
+    msp = doc.modelspace()
+
+    for name, color in [("OFFSETS_OK", 3), ("OFFSETS_ERR", 1)]:
+        if name not in doc.layers:
+            doc.layers.add(name=name, color=color)
+
+    create_arrow_block(doc)
+
+    layer_name = "OFFSETS_ERR" if dist > HEIGHT_THRESHOLD else "OFFSETS_OK"
+
+    text = f"{point_id}\n{litera} {dist:.2f}"
+
+    rad = math.radians(angle)
+    offset = Vec3(-9 * math.sin(rad), 9 * math.cos(rad), 0)
+    text_pos = pline_pt + offset
+
+    # Стрелка
+    msp.add_blockref(
+        "DIM_ARROW",
+        pline_pt,
+        dxfattribs={
+            "layer": layer_name,
+            "rotation": angle,
+            "xscale": 2.2,
+            "yscale": 2.2,
+        },
+    )
+
+    # Текст
+    mtext = msp.add_mtext(text, dxfattribs={
+        "layer": layer_name,
+        "char_height": 2.0,
+        "style": "Standard",
+        "attachment_point": 5,
+    })
+    mtext.set_location(text_pos, rotation=angle)
+
+
+def dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> bool:
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        drawing_matplotlib.qsave(
+            doc.modelspace(),
+            str(pdf_path),
+            dpi=150,
+            bg="#FFFFFF",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка PDF: {e}")
+        return False
+
+
+# ------------------------------------------------------------------
+# Хендлеры
+# ------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Пришлите <b>DXF-файл</b> с полилинией (база).\n\n"
+        "После этого пришлите <b>TXT</b> с точками.\n\n"
+        "Поддерживаемые форматы строк:\n"
+        "<code>1 100.5 200.3 15.0</code>\n"
+        "<code>1,100.5,200.3,15.0</code>\n"
+        "<code>1 100,5 200,3 15,0</code>\n"
+        "<code>100,5 200,3 15,0</code>  (без номера)\n\n"
+        "Красный цвет — если отклонение по высоте &gt; 18.\n\n"
+        "/cancel — отмена",
+        parse_mode="HTML",
+    )
+    return WAITING_DXF_BASE
+
+
+async def handle_base_dxf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if not document or not (document.file_name or "").lower().endswith(".dxf"):
+        await update.message.reply_text("Нужен файл с расширением .dxf")
+        return WAITING_DXF_BASE
+
+    user_id = update.effective_user.id
+    await update.message.reply_text("Сохраняю базу...")
+
+    file = await context.bot.get_file(document.file_id)
+    dxf_path = WORK_DIR / f"user_{user_id}_base.dxf"
+    await file.download_to_drive(dxf_path)
+
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        has_poly = any(e.dxftype() == "LWPOLYLINE" for e in doc.modelspace())
+        if not has_poly:
+            await update.message.reply_text(
+                "В файле не найдена полилиния (LWPOLYLINE).\nПришлите другой DXF."
+            )
+            return WAITING_DXF_BASE
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось прочитать DXF: {e}")
+        return WAITING_DXF_BASE
+
+    context.user_data["base_dxf"] = str(dxf_path)
+    await update.message.reply_text(
+        "База принята.\nТеперь пришлите TXT-файл с точками."
+    )
+    return WAITING_POINTS
+
+
+async def handle_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    base_path = context.user_data.get("base_dxf")
+    if not base_path:
+        await update.message.reply_text("Сначала пришлите DXF-базу. Нажмите /start")
+        return ConversationHandler.END
+
+    document = update.message.document
+    if not document or not (document.file_name or "").lower().endswith(".txt"):
+        await update.message.reply_text("Нужен файл с расширением .txt")
+        return WAITING_POINTS
+
+    user_id = update.effective_user.id
+    await update.message.reply_text("Считаю отклонения и рисую аннотации...")
+
+    file = await context.bot.get_file(document.file_id)
+    txt_path = WORK_DIR / f"user_{user_id}_points.txt"
+    await file.download_to_drive(txt_path)
+
+    try:
+        text = txt_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось прочитать TXT: {e}")
+        return ConversationHandler.END
+
+    points = parse_points_from_txt(text)
     if not points:
+        await update.message.reply_text("Не найдено ни одной валидной точки.")
+        return ConversationHandler.END
+
+    try:
+        doc = ezdxf.readfile(base_path)
+        msp = doc.modelspace()
+
+        polyline = next((e for e in msp if e.dxftype() == "LWPOLYLINE"), None)
+        if polyline is None:
+            await update.message.reply_text("Полилиния не найдена.")
+            return ConversationHandler.END
+
+        vertices = [
+            Vec3(v[0], v[1], v[2] if len(v) > 2 else 0.0)
+            for v in polyline.get_points("xyz")
+        ]
+
+        processed = 0
+        for point_id, pt in points:
+            closest, seg_idx, _ = find_closest_on_polyline(pt, vertices)
+            if closest is None:
+                continue
+
+            # Сторона (В / Н)
+            v_point = Vec3(pt.x - closest.x, pt.y - closest.y, 0)
+            start_seg = vertices[seg_idx]
+            end_seg = vertices[seg_idx + 1]
+            v_seg = Vec3(end_seg.x - start_seg.x, end_seg.y - start_seg.y, 0)
+
+            cross = v_seg.x * v_point.y - v_seg.y * v_point.x
+            litera = "В" if cross > 0 else "Н"
+
+            height_diff = abs(pt.z - closest.z)
+
+            angle = (end_seg - start_seg).angle_deg
+            if 90 < angle < 270:
+                angle += 180
+
+            add_annotation(doc, point_id, closest, angle, height_diff, litera)
+            processed += 1
+
+        out_path = WORK_DIR / f"user_{user_id}_result.dxf"
+        doc.saveas(out_path)
+        context.user_data["last_result"] = str(out_path)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Сделать PDF", callback_data="make_pdf")]
+        ])
+
+        await update.message.reply_text(f"Готово! Обработано точек: {processed}")
+
+        with open(out_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="Отклонения.dxf",
+                caption="DXF с аннотациями",
+                reply_markup=keyboard,
+            )
+
+    except Exception as e:
+        logger.exception("Ошибка обработки")
+        await update.message.reply_text(f"Ошибка при обработке:\n{e}")
+        traceback.print_exc()
+
+    return ConversationHandler.END
+
+
+async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    result_path = context.user_data.get("last_result")
+    if not result_path or not Path(result_path).exists():
+        await query.edit_message_caption(caption="Файл результата не найден. Начните заново /start")
         return
 
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    
-    fig, ax = plt.subplots(figsize=(8.27, 11.69), dpi=300)
-    
-    ax.scatter(xs, ys, c='black', s=10, zorder=3)
+    await query.edit_message_caption(caption="Создаю PDF...")
 
-    if c["polyline"] and len(points) >= 2:
-        ax.plot(xs, ys, c='blue', linewidth=0.5, zorder=2)
+    pdf_path = Path(result_path).with_suffix(".pdf")
+    success = dxf_to_pdf(Path(result_path), pdf_path)
 
-    if c["labels"]:
-        for i, (x, y) in enumerate(zip(xs, ys), 1):
-            ax.text(x, y, str(i), fontsize=6, ha='left', va='bottom', zorder=4)
+    if success and pdf_path.exists():
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=f,
+                filename="Отклонения.pdf",
+                caption="PDF готов",
+            )
+        await query.edit_message_caption(caption="PDF отправлен")
+    else:
+        await query.edit_message_caption(caption="Не удалось создать PDF")
 
-    ax.set_aspect('equal', adjustable='datalim')
-    ax.grid(True, linestyle='--', alpha=0.5)
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.margins(0.05)
-    
-    fig.savefig(out, format='pdf', bbox_inches='tight')
-    plt.close(fig)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Операция отменена.\nНажмите /start чтобы начать заново.")
+    return ConversationHandler.END
+
+
+# ------------------------------------------------------------------
+# Запуск
+# ------------------------------------------------------------------
+
+def main():
+    if BOT_TOKEN == "ВАШ_ТОКЕН_ОТ_BOTFATHER":
+        print("Ошибка: вставьте настоящий токен в переменную BOT_TOKEN")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            WAITING_DXF_BASE: [
+                MessageHandler(filters.Document.ALL, handle_base_dxf),
+            ],
+            WAITING_POINTS: [
+                MessageHandler(filters.Document.ALL, handle_points),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(button_make_pdf, pattern="^make_pdf$"))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    print("Бот запущен...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
